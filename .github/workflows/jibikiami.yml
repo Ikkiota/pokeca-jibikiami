@@ -1,0 +1,19 @@
+name: jibikiami
+on:
+  schedule:
+    - cron: "43 2 * * *"    # 日本時間 11:43
+    - cron: "13 10 * * *"   # 日本時間 19:13
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python3 jibikiami.py
+        env:
+          GAS_URL: ${{ secrets.GAS_URL }}
+          GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
+          SMALL: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
