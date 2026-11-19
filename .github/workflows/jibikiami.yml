@@ -1,9 +1,7 @@
 name: jibikiami
 on:
   schedule:
-    - cron: "47 23 * * *"   # 日本時間 8:47
-    - cron: "43 4 * * *"    # 日本時間 13:43
-    - cron: "17 12 * * *"   # 日本時間 21:17
+    - cron: "17 22,0,2,4,6,8,10,12,14 * * *"   # 日本時間 7:17から23:17まで、2時間ごと（1日9回）
   workflow_dispatch:
     inputs:
       small:
