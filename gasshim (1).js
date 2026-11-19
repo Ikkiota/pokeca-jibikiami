@@ -1,0 +1,183 @@
+// GitHub の上で、Googleのツール（コード.gs）を「そのまま」動かすための土台
+// ・シートの値と設定は、Googleのツールに頼んで読む（読むだけ）
+// ・eBay と仕入れ先へのアクセスは curl で直接
+// ・シートへの書き込みは、決まった記録用シートの「行を足す」だけ Google に送り返す（ほかの書き込みはしない）
+'use strict';
+const vm = require('vm'), fs = require('fs'), cp = require('child_process'), crypto = require('crypto');
+
+function curl(url, opt) {
+  opt = opt || {};
+  const m0 = String(opt.method || 'GET').toUpperCase();
+  // POST は -X を付けない（Googleのツールは 302 で別の住所に案内し、そこは GET でしか受けないため。curl は -X なしなら案内先を GET で開く）
+  const args = ['-sS', '-L', '--max-time', String(opt.timeout || 120), '-w', '\n__HTTP__%{http_code}', '-D', '-'];
+  if (m0 !== 'GET' && m0 !== 'POST') args.push('-X', m0);
+  Object.keys(opt.headers || {}).forEach(h => args.push('-H', h + ': ' + opt.headers[h]));
+  let input;
+  if (opt.payload !== undefined && opt.payload !== null) { args.push('--data-binary', '@-'); input = String(opt.payload); }
+  args.push(url);
+  const r = cp.spawnSync('curl', args, { input: input, encoding: 'utf8', maxBuffer: 300 * 1024 * 1024 });
+  if (r.error) return { code: 0, text: String(r.error.message), headers: {} };
+  const out = String(r.stdout || '');
+  const m = out.match(/\n__HTTP__(\d{3})$/);
+  const code = m ? Number(m[1]) : 0;
+  let body = m ? out.slice(0, m.index) : out;
+  // -D - で先頭にヘッダーが入る（リダイレクトのたびに）。最後のヘッダーの後ろが本文
+  let headers = {};
+  const parts = body.split(/\r?\n\r?\n/);
+  let k = 0; while (k < parts.length - 1 && /^HTTP\/[\d.]+ \d{3}/.test(parts[k])) k++;
+  if (k > 0) {
+    parts[k - 1].split(/\r?\n/).slice(1).forEach(l => { const i = l.indexOf(':'); if (i > 0) headers[l.slice(0, i).trim()] = l.slice(i + 1).trim(); });
+    body = parts.slice(k).join('\n\n');
+  }
+  return { code: code, text: body, headers: headers };
+}
+
+function makeGas(url, token) {
+  return function gas(data) {
+    const payload = 'token=' + encodeURIComponent(token) + '&data=' + encodeURIComponent(JSON.stringify(data));
+    for (let i = 0; i < 3; i++) {
+      const r = curl(url, { method: 'POST', payload: payload, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 330 });
+      try { return JSON.parse(r.text); } catch (e) {
+        if (i === 2) throw new Error('Googleのツールの返事が読めません（デプロイを新しいバージョンにしたか、GAS_URL・GAS_TOKEN を確かめてください）: HTTP ' + r.code + ' ' + String(r.text).slice(0, 200));
+        sleepMs(5000);
+      }
+    }
+  };
+}
+function sleepMs(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, ms)); }
+
+// コンテキストの中で動く部分（Date・Array などが Googleのツールのコードと同じ世界になるように、中で作る）
+const INSIDE = String.raw`
+(function () {
+  const H = __host;
+  const parse = s => JSON.parse(s, (k, v) => (v && typeof v === 'object' && v.__d !== undefined) ? new Date(v.__d) : v);
+  const chain = () => { const f = function () { return p; }; const p = new Proxy(f, { get: (t, k) => k === 'then' ? undefined : (k === Symbol.toPrimitive ? () => '' : chain()), apply: () => p }); return p; };
+  // ---- シート ----
+  const META = parse(H.meta());
+  const SHEETS = {};
+  const appended = [];
+  function colNum(s) { let n = 0; for (const ch of s.toUpperCase()) n = n * 26 + (ch.charCodeAt(0) - 64); return n; }
+  function a1(sheet, s) {
+    s = String(s).replace(/^.*!/, '').replace(/\$/g, '');
+    const one = x => { const m = x.match(/^([A-Za-z]*)(\d*)$/); return { c: m[1] ? colNum(m[1]) : null, r: m[2] ? Number(m[2]) : null }; };
+    const [a, b] = s.split(':'); const A = one(a), B = b ? one(b) : A;
+    const r1 = A.r || 1, c1 = A.c || 1, r2 = B.r || Math.max(sheet.getLastRow(), r1), c2 = B.c || Math.max(sheet.getLastColumn(), c1);
+    return [r1, c1, r2 - r1 + 1, c2 - c1 + 1];
+  }
+  function mkSheet(name, m) {
+    const st = { name: name, rows: m ? m.rows : 0, cols: m ? m.cols : 0, maxRows: m ? m.maxRows : 1000, maxCols: m ? m.maxCols : 26, full: null, rc: {}, extra: [] };
+    const big = () => st.rows * st.cols > 150000;
+    function read(r, c, nr, nc, kind) {
+      if (!kind && !big() && st.rows > 0) {
+        if (!st.full) { const x = H.range(name, 1, 1, Math.max(1, st.rows), Math.max(1, st.cols), ''); st.full = x ? parse(x).values : []; }
+        const out = [];
+        for (let i = 0; i < nr; i++) { const row = []; for (let j = 0; j < nc; j++) { const R = st.full[r - 1 + i]; let v = R ? R[c - 1 + j] : undefined; if (v === undefined) { const e = st.extra[r - 1 + i - st.rows]; v = e ? e[c - 1 + j] : undefined; } row.push(v === undefined ? '' : v); } out.push(row); }
+        return out;
+      }
+      const key = [r, c, nr, nc, kind || ''].join(',');
+      if (!st.rc[key]) {
+        const nr2 = Math.max(1, Math.min(nr, Math.max(1, st.rows - r + 1)));
+        const x = st.rows >= r ? H.range(name, r, c, nr2, nc, kind || '') : null;
+        let vals = x ? (parse(x)[kind === 'links' ? 'links' : kind === 'display' ? 'display' : 'values'] || []) : [];
+        while (vals.length < nr) vals.push(new Array(nc).fill(''));
+        st.rc[key] = vals;
+      }
+      return st.rc[key].map(row => row.slice());
+    }
+    function range(r, c, nr, nc) {
+      nr = nr || 1; nc = nc || 1;
+      const rg = new Proxy({
+        getValues: () => read(r, c, nr, nc), getValue: () => read(r, c, 1, 1)[0][0],
+        getDisplayValues: () => read(r, c, nr, nc, 'display'), getDisplayValue: () => String(read(r, c, 1, 1, 'display')[0][0]),
+        getRichTextValues: () => read(r, c, nr, nc, 'links').map(row => row.map(u => ({ getLinkUrl: () => u || null, getText: () => '', getRuns: () => [{ getLinkUrl: () => u || null, getText: () => '' }] }))),
+        getRichTextValue: () => { const u = read(r, c, 1, 1, 'links')[0][0]; return { getLinkUrl: () => u || null, getText: () => '', getRuns: () => [{ getLinkUrl: () => u || null }] }; },
+        getFormulas: () => read(r, c, nr, nc).map(row => row.map(() => '')), getFormula: () => '',
+        getNumRows: () => nr, getNumColumns: () => nc, getRow: () => r, getColumn: () => c, getLastRow: () => r + nr - 1, getLastColumn: () => c + nc - 1,
+        getSheet: () => sheet, getA1Notation: () => '', isBlank: () => read(r, c, nr, nc).every(row => row.every(v => v === '')),
+        getBackgrounds: () => read(r, c, nr, nc).map(row => row.map(() => '#ffffff')), getBackground: () => '#ffffff',
+        offset: (dr, dc, a, b) => range(r + dr, c + dc, a || nr, b || nc),
+      }, { get: (t, k) => k in t ? t[k] : (k === 'then' ? undefined : () => rg) });   // setValue などの書き込みは、何もしない
+      return rg;
+    }
+    const sheet = new Proxy({
+      getName: () => name, getLastRow: () => st.rows + st.extra.length, getLastColumn: () => st.cols, getMaxRows: () => st.maxRows, getMaxColumns: () => st.maxCols,
+      getRange: (a, b, c2, d) => typeof a === 'string' ? range(...a1(sheet, a)) : range(a, b, c2, d),
+      getDataRange: () => range(1, 1, Math.max(1, st.rows), Math.max(1, st.cols)),
+      appendRow: row => { st.extra.push(row); appended.push({ sheet: name, row: row.map(v => v instanceof Date ? { __d: v.getTime() } : v) }); return sheet; },
+      getSheetId: () => 0, getIndex: () => 0, getParent: () => SS,
+    }, { get: (t, k) => k in t ? t[k] : (k === 'then' ? undefined : () => sheet) });
+    return sheet;
+  }
+  META.sheets.forEach(m => { SHEETS[m.name] = mkSheet(m.name, m); });
+  const SS = new Proxy({
+    getSheetByName: n => SHEETS[n] || null, getSheets: () => Object.keys(SHEETS).map(k => SHEETS[k]),
+    insertSheet: n => (SHEETS[n] = mkSheet(n, null)), getId: () => META.ssId, getUrl: () => 'https://docs.google.com/spreadsheets/d/' + META.ssId + '/edit', getName: () => 'ポケカ専門店',
+    getActiveSheet: () => null,
+  }, { get: (t, k) => k in t ? t[k] : (k === 'then' ? undefined : () => SS) });
+  globalThis.SpreadsheetApp = new Proxy({ getActiveSpreadsheet: () => SS, getActive: () => SS, openById: () => SS, flush: () => {}, getUi: () => chain() }, { get: (t, k) => k in t ? t[k] : chain() });
+  // ---- 設定（Properties）・キャッシュ ----
+  const PR = parse(H.props());
+  const props = PR.props || {};
+  const P = { getProperty: k => (k in props ? props[k] : null), setProperty: (k, v) => { props[k] = String(v); return P; }, deleteProperty: k => { delete props[k]; return P; },
+    getProperties: () => Object.assign({}, props), setProperties: o => { Object.keys(o).forEach(k => props[k] = String(o[k])); return P; }, getKeys: () => Object.keys(props), deleteAllProperties: () => P };
+  globalThis.PropertiesService = { getScriptProperties: () => P, getUserProperties: () => P, getDocumentProperties: () => P };
+  const cache = { tok_app: PR.appToken || '' };
+  const C = { get: k => (k in cache ? cache[k] : null), put: (k, v) => { cache[k] = String(v); }, remove: k => { delete cache[k]; }, getAll: ks => { const o = {}; ks.forEach(k => { if (k in cache) o[k] = cache[k]; }); return o; }, putAll: o => { Object.assign(cache, o); }, removeAll: ks => ks.forEach(k => delete cache[k]) };
+  globalThis.CacheService = { getScriptCache: () => C, getUserCache: () => C, getDocumentCache: () => C };
+  // ---- ネット ----
+  function resp(x) { const o = parse(x); return { getResponseCode: () => o.code, getContentText: () => o.text, getHeaders: () => o.headers, getAllHeaders: () => o.headers, getBlob: () => ({ getDataAsString: () => o.text, getContentType: () => o.headers['content-type'] || '' }) }; }
+  globalThis.UrlFetchApp = {
+    fetch: (url, p) => { p = p || {}; const h = Object.assign({}, p.headers || {}); if (p.contentType) h['Content-Type'] = p.contentType;
+      let pl = p.payload; if (pl && typeof pl === 'object') { pl = Object.keys(pl).map(k => encodeURIComponent(k) + '=' + encodeURIComponent(pl[k])).join('&'); if (!h['Content-Type']) h['Content-Type'] = 'application/x-www-form-urlencoded'; }
+      const r = resp(H.fetch(String(url), JSON.stringify({ method: p.method || 'get', headers: h, payload: pl })));
+      if (!p.muteHttpExceptions && r.getResponseCode() >= 400) throw new Error('Request failed for ' + url + ' returned code ' + r.getResponseCode());
+      return r; },
+    fetchAll: reqs => reqs.map(q => globalThis.UrlFetchApp.fetch(q.url, Object.assign({}, q, { muteHttpExceptions: true }))),
+  };
+  // ---- そのほか ----
+  const pad = (n, w) => String(n).padStart(w, '0');
+  function partsIn(d, tz) { const f = new Intl.DateTimeFormat('en-US', { timeZone: tz || 'Asia/Tokyo', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric', weekday: 'short', hourCycle: 'h23' });
+    const o = {}; f.formatToParts(d).forEach(x => o[x.type] = x.value); return o; }
+  globalThis.Utilities = {
+    formatDate: (d, tz, fmt) => { const o = partsIn(new Date(d), tz); const y = Number(o.year), M = Number(o.month), D = Number(o.day), h = Number(o.hour) % 24, m = Number(o.minute), s = Number(o.second);
+      return String(fmt).replace(/yyyy|yy|MM|M|dd|d|HH|H|mm|ss|EEE|E|'([^']*)'/g, t => ({ yyyy: y, yy: pad(y % 100, 2), MM: pad(M, 2), M: M, dd: pad(D, 2), d: D, HH: pad(h, 2), H: h, mm: pad(m, 2), ss: pad(s, 2), EEE: o.weekday, E: o.weekday })[t] ?? t.replace(/'/g, '')); },
+    sleep: ms => H.sleep(ms), getUuid: () => H.uuid(),
+    computeDigest: (alg, s) => JSON.parse(H.digest(String(alg), String(s))),
+    base64Encode: s => H.b64(JSON.stringify(s), false), base64EncodeWebSafe: s => H.b64(JSON.stringify(s), true), base64Decode: s => JSON.parse(H.b64d(String(s))), newBlob: (s) => ({ getDataAsString: () => String(s), getBytes: () => [] }),
+    parseCsv: s => String(s).split(/\r?\n/).map(l => l.split(',')),
+    DigestAlgorithm: { MD5: 'md5', SHA_1: 'sha1', SHA_256: 'sha256' }, Charset: { UTF_8: 'utf8' },
+  };
+  const LK = { tryLock: () => true, waitLock: () => {}, releaseLock: () => {}, hasLock: () => true };
+  globalThis.LockService = { getScriptLock: () => LK, getDocumentLock: () => LK, getUserLock: () => LK };
+  globalThis.Session = { getEffectiveUser: () => ({ getEmail: () => '' }), getActiveUser: () => ({ getEmail: () => '' }), getScriptTimeZone: () => 'Asia/Tokyo' };
+  globalThis.ScriptApp = new Proxy({ getProjectTriggers: () => [], deleteTrigger: () => {} }, { get: (t, k) => k in t ? t[k] : chain() });
+  globalThis.MailApp = { sendEmail: () => H.log('（メールは送らない）') }; globalThis.GmailApp = chain();
+  globalThis.Logger = { log: x => H.log(String(x)) }; globalThis.console = { log: x => H.log(String(x)), error: x => H.log(String(x)) };
+  globalThis.ContentService = { createTextOutput: s => ({ setMimeType: function () { return this; }, getContent: () => s }), MimeType: { JSON: 'json', TEXT: 'text' } };
+  globalThis.HtmlService = chain(); globalThis.DriveApp = chain(); globalThis.Drive = chain();
+  globalThis.__appended = appended; globalThis.__parse = parse; globalThis.__set = a => new Set(a || []);
+})();
+`;
+
+function load(codePath, gas) {
+  const meta = gas({ kind: 'ghxmeta' });
+  if (meta.error) throw new Error('ghxmeta：' + meta.error + '（v238 をデプロイしたか確かめてください）');
+  const pr = gas({ kind: 'ghxprops' });
+  if (pr.error) throw new Error('ghxprops：' + pr.error);
+  let calls = 0;
+  const host = {
+    meta: () => JSON.stringify(meta), props: () => JSON.stringify(pr),
+    range: (sheet, r, c, nr, nc, kind) => { calls++; const x = gas({ kind: 'ghxrange', reqs: [{ id: 1, sheet: sheet, r: r, c: c, nr: nr, nc: nc, display: kind === 'display', links: kind === 'links' }] }); const o = (x.ranges || [])[0] || {}; return o.missing || o.tooBig ? null : JSON.stringify(o); },
+    fetch: (url, p) => { const o = JSON.parse(p); const r = curl(url, { method: o.method, headers: o.headers, payload: o.payload }); return JSON.stringify(r); },
+    sleep: ms => sleepMs(ms), uuid: () => crypto.randomUUID(),
+    digest: (alg, s) => JSON.stringify(Array.from(crypto.createHash(alg).update(s, 'utf8').digest()).map(b => b > 127 ? b - 256 : b)),
+    b64: (j, web) => { const v = JSON.parse(j); const b = Array.isArray(v) ? Buffer.from(v.map(x => x & 255)) : Buffer.from(String(v), 'utf8'); const t = b.toString('base64'); return web ? t.replace(/\+/g, '-').replace(/\//g, '_') : t; }, b64d: s => JSON.stringify(Array.from(Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64')).map(x => x > 127 ? x - 256 : x)), log: s => console.log('  [ツール] ' + s),
+  };
+  const ctx = vm.createContext({ __host: host });
+  vm.runInContext(INSIDE, ctx, { filename: 'gasshim-inside.js' });
+  vm.runInContext(fs.readFileSync(codePath, 'utf8'), ctx, { filename: 'コード.gs' });
+  ctx.__calls = () => calls;
+  return ctx;
+}
+
+module.exports = { load, curl, makeGas, sleepMs };
