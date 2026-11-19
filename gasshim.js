@@ -8,6 +8,7 @@ const vm = require('vm'), fs = require('fs'), cp = require('child_process'), cry
 function curl(url, opt) {
   opt = opt || {};
    const m0 = String(opt.method || 'GET').toUpperCase();
+    const m0 = String(opt.method || 'GET').toUpperCase();
   const args = ['-sS', '-L', '--max-time', String(opt.timeout || 120), '-w', '\n__HTTP__%{http_code}', '-D', '-'];
   if (m0 !== 'GET' && m0 !== 'POST') args.push('-X', m0);
   let input;
