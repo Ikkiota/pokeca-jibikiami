@@ -5,19 +5,32 @@ on:
     - cron: "43 4 * * *"    # 日本時間 13:43
     - cron: "17 12 * * *"   # 日本時間 21:17
   workflow_dispatch:
+    inputs:
+      small:
+        description: "試しの小さい回にする（1）・ふつうの回（0）"
+        default: "0"
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: "20" }
-      - run: node jibikiami.js
+      - name: いちばん新しい版を選んで動かす（ファイル名に (1) が付いても動く）
+        run: |
+          node -e '
+          const fs = require("fs");
+          const pick = re => fs.readdirSync(".").filter(f => re.test(f)).map(f => { const m = fs.readFileSync(f, "utf8").match(/Z_GH_VER\s*=\s*.v(\d+)/); return [m ? Number(m[1]) : 0, f]; }).sort((a, b) => b[0] - a[0])[0][1];
+          const js = pick(/^jibikiami.*\.js$/), gs = pick(/^tool.*\.gs$/);
+          console.log("使う版：", js, "／", gs);
+          fs.copyFileSync(js, "__run.js"); fs.copyFileSync(gs, "__tool.gs");'
+          node __run.js
         env:
           GAS_URL: ${{ secrets.GAS_URL }}
           GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
-          SMALL: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          TOOL_CODE: __tool.gs
+          SMALL: ${{ github.event.inputs.small == '1' && '1' || '0' }}
           MAX_SEARCH: "30"
           MAX_PAGES: "15"
           MINUTES: "19"
