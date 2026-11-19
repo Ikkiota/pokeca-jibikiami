@@ -7,8 +7,9 @@ const vm = require('vm'), fs = require('fs'), cp = require('child_process'), cry
 
 function curl(url, opt) {
   opt = opt || {};
-  const args = ['-sS', '-L', '--max-time', String(opt.timeout || 120), '-X', String(opt.method || 'GET').toUpperCase(), '-w', '\n__HTTP__%{http_code}', '-D', '-'];
-  Object.keys(opt.headers || {}).forEach(h => args.push('-H', h + ': ' + opt.headers[h]));
+   const m0 = String(opt.method || 'GET').toUpperCase();
+  const args = ['-sS', '-L', '--max-time', String(opt.timeout || 120), '-w', '\n__HTTP__%{http_code}', '-D', '-'];
+  if (m0 !== 'GET' && m0 !== 'POST') args.push('-X', m0);
   let input;
   if (opt.payload !== undefined && opt.payload !== null) { args.push('--data-binary', '@-'); input = String(opt.payload); }
   args.push(url);
