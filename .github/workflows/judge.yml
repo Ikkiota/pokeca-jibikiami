@@ -29,3 +29,4 @@ jobs:
           TOOL_CODE: __tool.gs
           MODE: judge
           JUDGE_MINUTES: "20"
+          LIST_SPLIT: "1"   # v267：出品は list.yml が同時にする
