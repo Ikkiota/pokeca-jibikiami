@@ -1,0 +1,40 @@
+name: judge
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # 15分ごと：まとめ判定・利益計算・出品
+  workflow_dispatch:
+concurrency:
+  group: judge
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 28
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]   # v273：判定を2台で同時に（同じ型番の品は必ず同じ台）
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: いちばん新しい版を選んで、判定・出品をする
+        run: |
+          node -e '
+          const fs = require("fs");
+          const ver = f => { const m = fs.readFileSync(f, "utf8").match(/Z_GH_VER\s*=\s*.v(\d+)/); return m ? Number(m[1]) : 0; };
+          const pick = re => fs.readdirSync(".").filter(f => re.test(f)).map(f => [ver(f), f]).sort((a, b) => b[0] - a[0])[0];
+          const js = pick(/^jibikiami.*\.js$/), gs = pick(/^tool.*\.gs$/);
+          console.log("使う版：", js[1], "／", gs[1], "・", Number(process.env.SHARD) + 1, "台目");
+          if (process.env.SHARD !== "0" && (js[0] < 273 || gs[0] < 273)) { console.log("v273 より前の版なので、2台目は何もしない"); fs.writeFileSync("__run.js", ""); }
+          else { fs.copyFileSync(js[1], "__run.js"); fs.copyFileSync(gs[1], "__tool.gs"); }'
+          node __run.js
+        env:
+          GAS_URL: ${{ secrets.GAS_URL }}
+          GAS_TOKEN: ${{ secrets.GAS_TOKEN }}
+          TOOL_CODE: __tool.gs
+          MODE: judge
+          JUDGE_MINUTES: "20"
+          LIST_SPLIT: "1"   # v267：出品は list.yml が同時にする
+          SHARD: ${{ matrix.shard }}
+          SHARDS: "2"
